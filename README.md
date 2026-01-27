@@ -18,7 +18,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
 2. Use Node.js 18+ (the bot relies on the latest Telegram Bot API features).
 3. Clone this repository and install dependencies:
    ```bash
-   npm install
+   pnpm install
    ```
 4. Provide the bot token (and optionally override the ban log path) in an `.env` file:
    ```bash
@@ -30,7 +30,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
    ```
 5. Run the bot:
    ```bash
-   npm start
+   pnpm start
    # or
    pnpm dev
    ```
