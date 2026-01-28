@@ -5,6 +5,9 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
 ## Features
 
 - Detects every flavor of manual forwards (from users, channels, or external chats)
+- Removes Telegram invite links to other groups/channels and bans whoever posts them
+- Blocks messages sent by non-admin bots (including inline `via @bot` spam and quoted bot messages)
+- Removes quotes of users from other chats to stop cross-posting spam
 - Deletes the forwarded message before anyone sees it
 - Bans the sender, while skipping administrators and automatic forwards from linked channels
 - Writes every ban to `banned.log` (or a custom file) for effortless auditing
@@ -18,7 +21,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
 2. Use Node.js 18+ (the bot relies on the latest Telegram Bot API features).
 3. Clone this repository and install dependencies:
    ```bash
-   pnpm install
+   npm install
    ```
 4. Provide the bot token (and optionally override the ban log path) in an `.env` file:
    ```bash
@@ -30,7 +33,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
    ```
 5. Run the bot:
    ```bash
-   pnpm start
+   npm start
    # or
    pnpm dev
    ```
@@ -43,4 +46,4 @@ Every successful ban is also appended to the file specified via `BAN_LOG_PATH` (
 
 Need a rehearsal run? Set `TEST_MODE=true` so the bot only logs (to stdout) what it would delete/ban without touching any user or message in Telegram. Flip it back to `false` for full enforcement.
 
-For best results, give the bot the administrator permissions to delete messages and ban members. The bot refuses to start if it does not have a valid token.
+For best results, give the bot the administrator permissions to delete messages, ban members, and manage invites. Without the invite permission the bot cannot confirm whether a `t.me/+HASH` link belongs to your chat, so private invites might slip through moderation. The bot refuses to start if it does not have a valid token.
