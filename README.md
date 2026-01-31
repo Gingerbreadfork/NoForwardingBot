@@ -29,6 +29,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
    BOT_TOKEN=123456:ABC
    BAN_LOG_PATH=./banned.log
    TEST_MODE=false
+   CHAT_NOTIFICATIONS_ENABLED=true
    EOF
    ```
 5. Run the bot:
@@ -45,5 +46,7 @@ The bot listens to every message in the group. If Telegram marks the message as 
 Every successful ban is also appended to the file specified via `BAN_LOG_PATH` (defaults to `./banned.log`). Each line includes the timestamp, chat information, and the user who was removed—the perfect audit trail for moderators. Relative paths are resolved from the project root (alongside this README) and the directory is created automatically if it does not exist.
 
 Need a rehearsal run? Set `TEST_MODE=true` so the bot only logs (to stdout) what it would delete/ban without touching any user or message in Telegram. Flip it back to `false` for full enforcement.
+
+Want to keep moderation noise out of the chat entirely? Set `CHAT_NOTIFICATIONS_ENABLED=false` so bans are still enforced and logged to stdout/banned.log without posting confirmation messages in Telegram.
 
 For best results, give the bot the administrator permissions to delete messages, ban members, and manage invites. Without the invite permission the bot cannot confirm whether a `t.me/+HASH` link belongs to your chat, so private invites might slip through moderation. The bot refuses to start if it does not have a valid token.
