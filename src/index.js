@@ -6,6 +6,20 @@ import { Telegraf } from 'telegraf';
 
 loadEnv();
 
+const parseBooleanEnv = (value, defaultValue = false) => {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+};
+
 const requiredToken = process.env.BOT_TOKEN;
 
 if (!requiredToken) {
@@ -21,7 +35,8 @@ const resolvedBanPath = isAbsolute(configuredBanPath)
   : resolve(projectRoot, configuredBanPath);
 const BAN_LOG_PATH = resolvedBanPath;
 let logDirEnsured = false;
-const TEST_MODE = String(process.env.TEST_MODE || '').toLowerCase() === 'true';
+const TEST_MODE = parseBooleanEnv(process.env.TEST_MODE, false);
+const CHAT_NOTIFICATIONS_ENABLED = parseBooleanEnv(process.env.CHAT_NOTIFICATIONS_ENABLED, true);
 
 const bot = new Telegraf(requiredToken, {
   handlerTimeout: 9_000
@@ -935,6 +950,9 @@ const getBanSkipReason = (message) => {
 };
 
 const logAction = async (ctx, text, options = {}) => {
+  if (!CHAT_NOTIFICATIONS_ENABLED) {
+    return;
+  }
   const threadId = ctx.message?.message_thread_id;
   const chatId = ctx.chat?.id ?? ctx.message?.chat?.id;
   if (!chatId) {
