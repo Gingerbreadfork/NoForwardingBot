@@ -53,7 +53,7 @@ const CHAT_NOTIFICATIONS_ENABLED = parseBooleanEnv(process.env.CHAT_NOTIFICATION
 const BLOCK_CONTACTS = parseBooleanEnv(process.env.BLOCK_CONTACTS, true);
 const BLOCK_REPEATED_MESSAGES = parseBooleanEnv(process.env.BLOCK_REPEATED_MESSAGES, true);
 const REPEAT_MESSAGE_LIMIT = parseIntegerEnv('REPEAT_MESSAGE_LIMIT', 2, { min: 1 });
-const REPEAT_MESSAGE_WINDOW = parseIntegerEnv('REPEAT_MESSAGE_WINDOW', 50, { min: 1 });
+const REPEAT_MESSAGE_WINDOW = parseIntegerEnv('REPEAT_MESSAGE_WINDOW', 25, { min: 1 });
 const REPEAT_MESSAGE_MIN_LENGTH = parseIntegerEnv('REPEAT_MESSAGE_MIN_LENGTH', 1, { min: 1 });
 
 const bot = new Telegraf(requiredToken, {
