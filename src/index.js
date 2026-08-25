@@ -20,6 +20,19 @@ const parseBooleanEnv = (value, defaultValue = false) => {
   return defaultValue;
 };
 
+const parseIntegerEnv = (name, defaultValue, { min = 0 } = {}) => {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(String(raw).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    console.warn(`Ignoring invalid ${name}="${raw}" (expected an integer >= ${min}); using ${defaultValue}.`);
+    return defaultValue;
+  }
+  return parsed;
+};
+
 const requiredToken = process.env.BOT_TOKEN;
 
 if (!requiredToken) {
@@ -38,6 +51,10 @@ let logDirEnsured = false;
 const TEST_MODE = parseBooleanEnv(process.env.TEST_MODE, false);
 const CHAT_NOTIFICATIONS_ENABLED = parseBooleanEnv(process.env.CHAT_NOTIFICATIONS_ENABLED, true);
 const BLOCK_CONTACTS = parseBooleanEnv(process.env.BLOCK_CONTACTS, true);
+const BLOCK_REPEATED_MESSAGES = parseBooleanEnv(process.env.BLOCK_REPEATED_MESSAGES, true);
+const REPEAT_MESSAGE_LIMIT = parseIntegerEnv('REPEAT_MESSAGE_LIMIT', 2, { min: 1 });
+const REPEAT_MESSAGE_WINDOW = parseIntegerEnv('REPEAT_MESSAGE_WINDOW', 50, { min: 1 });
+const REPEAT_MESSAGE_MIN_LENGTH = parseIntegerEnv('REPEAT_MESSAGE_MIN_LENGTH', 1, { min: 1 });
 
 const bot = new Telegraf(requiredToken, {
   handlerTimeout: 9_000
@@ -82,6 +99,11 @@ const VIOLATION_TYPES = {
     type: 'contact',
     logLabel: 'Shared contact',
     actionDescription: 'sharing a contact'
+  },
+  repeatedMessage: {
+    type: 'repeated_message',
+    logLabel: 'Repeated message',
+    actionDescription: 'sending the same message repeatedly'
   }
 };
 
@@ -819,6 +841,87 @@ const detectContactDetails = (message = {}) => {
   };
 };
 
+const RECENT_MESSAGES_BY_CHAT = new Map();
+const REPEAT_MEDIA_FIELDS = ['photo', 'video', 'document', 'animation', 'audio', 'voice', 'video_note', 'sticker'];
+
+const normalizeRepeatText = (value = '') => value.replace(/\s+/g, ' ').trim().toLowerCase();
+
+const extractMediaUniqueId = (message = {}) => {
+  for (const field of REPEAT_MEDIA_FIELDS) {
+    const media = message[field];
+    if (!media) {
+      continue;
+    }
+    if (Array.isArray(media)) {
+      const largest = media[media.length - 1];
+      return largest?.file_unique_id ? `${field}:${largest.file_unique_id}` : null;
+    }
+    return media.file_unique_id ? `${field}:${media.file_unique_id}` : null;
+  }
+  return null;
+};
+
+const buildMessageFingerprint = (message = {}) => {
+  const text = normalizeRepeatText(message.text ?? message.caption ?? '');
+  const mediaId = extractMediaUniqueId(message);
+  if (!text && !mediaId) {
+    return null;
+  }
+  if (text && text.length < REPEAT_MESSAGE_MIN_LENGTH && !mediaId) {
+    return null;
+  }
+  return [text, mediaId ?? ''].join('\u0000');
+};
+
+const getRecentMessages = (chatId) => {
+  let entries = RECENT_MESSAGES_BY_CHAT.get(chatId);
+  if (!entries) {
+    entries = [];
+    RECENT_MESSAGES_BY_CHAT.set(chatId, entries);
+  }
+  return entries;
+};
+
+const recordRecentMessage = (chat = {}, message = {}) => {
+  if (!BLOCK_REPEATED_MESSAGES || chat.id === undefined) {
+    return;
+  }
+  const entries = getRecentMessages(chat.id);
+  entries.push({
+    senderId: message.from?.id ?? null,
+    fingerprint: buildMessageFingerprint(message)
+  });
+  if (entries.length > REPEAT_MESSAGE_WINDOW) {
+    entries.splice(0, entries.length - REPEAT_MESSAGE_WINDOW);
+  }
+};
+
+const detectRepeatedMessageDetails = (chat = {}, message = {}) => {
+  if (!BLOCK_REPEATED_MESSAGES || message.is_automatic_forward || chat.id === undefined) {
+    return null;
+  }
+  const senderId = message.from?.id;
+  if (senderId === undefined) {
+    return null;
+  }
+  const fingerprint = buildMessageFingerprint(message);
+  if (!fingerprint) {
+    return null;
+  }
+  const entries = RECENT_MESSAGES_BY_CHAT.get(chat.id) ?? [];
+  const priorMatches = entries.filter(
+    (entry) => entry.senderId === senderId && entry.fingerprint === fingerprint
+  ).length;
+  if (priorMatches < REPEAT_MESSAGE_LIMIT) {
+    return null;
+  }
+  return {
+    reason: 'repeated_message',
+    repeat_count: priorMatches + 1,
+    repeat_window: REPEAT_MESSAGE_WINDOW
+  };
+};
+
 const detectViolation = async (ctx) => {
   const { message, chat } = ctx;
   if (!message) {
@@ -865,6 +968,14 @@ const detectViolation = async (ctx) => {
         quoted_chat_id: externalQuote.chat_id,
         quoted_chat_title: normalizeForLog(externalQuote.title)
       }
+    };
+  }
+
+  const repeatedDetails = detectRepeatedMessageDetails(chat, message);
+  if (repeatedDetails) {
+    return {
+      ...VIOLATION_TYPES.repeatedMessage,
+      details: repeatedDetails
     };
   }
 
@@ -1025,6 +1136,7 @@ bot.on('message', async (ctx, next) => {
   }
 
   const violation = await detectViolation(ctx);
+  recordRecentMessage(chat, message);
 
   if (!violation) {
     return next();
@@ -1067,7 +1179,9 @@ const contextDetails = {
       : {}),
     ...(violation.details && Object.hasOwn(violation.details, 'contact_user_id')
       ? { contact_user_id: violation.details.contact_user_id }
-      : {})
+      : {}),
+    ...(violation.details?.repeat_count ? { repeat_count: violation.details.repeat_count } : {}),
+    ...(violation.details?.repeat_window ? { repeat_window: violation.details.repeat_window } : {})
 };
 
   if (violation.type === 'forward' && message.is_automatic_forward) {
@@ -1172,6 +1286,13 @@ bot.launch({ dropPendingUpdates: true }).then(() => {
   }
   if (!BLOCK_CONTACTS) {
     console.log('Contact sharing enforcement is disabled (BLOCK_CONTACTS=false).');
+  }
+  if (BLOCK_REPEATED_MESSAGES) {
+    console.log(
+      `Repeated message enforcement: more than ${REPEAT_MESSAGE_LIMIT} identical sends within the last ${REPEAT_MESSAGE_WINDOW} messages (min length ${REPEAT_MESSAGE_MIN_LENGTH}).`
+    );
+  } else {
+    console.log('Repeated message enforcement is disabled (BLOCK_REPEATED_MESSAGES=false).');
   }
 });
 
