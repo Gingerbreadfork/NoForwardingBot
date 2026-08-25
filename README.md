@@ -8,6 +8,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
 - Removes Telegram invite links to other groups/channels and bans whoever posts them
 - Blocks messages sent by non-admin bots (including inline `via @bot` spam and quoted bot messages)
 - Removes quotes of users from other chats to stop cross-posting spam
+- Bans anyone who shares a contact card (toggle with `BLOCK_CONTACTS`)
 - Deletes the forwarded message before anyone sees it
 - Bans the sender, while skipping administrators and automatic forwards from linked channels
 - Writes every ban to `banned.log` (or a custom file) for effortless auditing
@@ -30,6 +31,7 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
    BAN_LOG_PATH=./banned.log
    TEST_MODE=false
    CHAT_NOTIFICATIONS_ENABLED=true
+   BLOCK_CONTACTS=true
    EOF
    ```
 5. Run the bot:
@@ -48,5 +50,7 @@ Every successful ban is also appended to the file specified via `BAN_LOG_PATH` (
 Need a rehearsal run? Set `TEST_MODE=true` so the bot only logs (to stdout) what it would delete/ban without touching any user or message in Telegram. Flip it back to `false` for full enforcement.
 
 Want to keep moderation noise out of the chat entirely? Set `CHAT_NOTIFICATIONS_ENABLED=false` so bans are still enforced and logged to stdout/banned.log without posting confirmation messages in Telegram.
+
+Shared contact cards are treated as spam by default: the message is deleted and the sender is banned (admins are exempt, as with every other rule). Set `BLOCK_CONTACTS=false` to allow members to share contacts.
 
 For best results, give the bot the administrator permissions to delete messages, ban members, and manage invites. Without the invite permission the bot cannot confirm whether a `t.me/+HASH` link belongs to your chat, so private invites might slip through moderation. The bot refuses to start if it does not have a valid token.

@@ -37,6 +37,7 @@ const BAN_LOG_PATH = resolvedBanPath;
 let logDirEnsured = false;
 const TEST_MODE = parseBooleanEnv(process.env.TEST_MODE, false);
 const CHAT_NOTIFICATIONS_ENABLED = parseBooleanEnv(process.env.CHAT_NOTIFICATIONS_ENABLED, true);
+const BLOCK_CONTACTS = parseBooleanEnv(process.env.BLOCK_CONTACTS, true);
 
 const bot = new Telegraf(requiredToken, {
   handlerTimeout: 9_000
@@ -76,6 +77,11 @@ const VIOLATION_TYPES = {
     type: 'quote_external',
     logLabel: 'External quote',
     actionDescription: 'quoting a user from another chat'
+  },
+  contact: {
+    type: 'contact',
+    logLabel: 'Shared contact',
+    actionDescription: 'sharing a contact'
   }
 };
 
@@ -801,6 +807,18 @@ const detectBotMessageDetails = (message = {}) => {
   return null;
 };
 
+const detectContactDetails = (message = {}) => {
+  if (!BLOCK_CONTACTS || !message.contact) {
+    return null;
+  }
+
+  const contactUserId = message.contact.user_id;
+  return {
+    reason: 'shared_contact',
+    ...(contactUserId !== undefined ? { contact_user_id: contactUserId } : {})
+  };
+};
+
 const detectViolation = async (ctx) => {
   const { message, chat } = ctx;
   if (!message) {
@@ -811,6 +829,14 @@ const detectViolation = async (ctx) => {
     return {
       ...VIOLATION_TYPES.forward,
       details: { reason: 'forwarded_message' }
+    };
+  }
+
+  const contactDetails = detectContactDetails(message);
+  if (contactDetails) {
+    return {
+      ...VIOLATION_TYPES.contact,
+      details: contactDetails
     };
   }
 
@@ -1038,6 +1064,9 @@ const contextDetails = {
     ...(violation.details?.quoted_chat_id ? { quoted_chat_id: violation.details.quoted_chat_id } : {}),
     ...(violation.details?.quoted_chat_title
       ? { quoted_chat_title: violation.details.quoted_chat_title }
+      : {}),
+    ...(violation.details && Object.hasOwn(violation.details, 'contact_user_id')
+      ? { contact_user_id: violation.details.contact_user_id }
       : {})
 };
 
@@ -1140,6 +1169,9 @@ bot.launch({ dropPendingUpdates: true }).then(() => {
   console.log('NoForwardingBot is now watching for forwarded spam...');
   if (TEST_MODE) {
     console.warn('NoForwardingBot is running in TEST_MODE. No bans or deletions will be performed.');
+  }
+  if (!BLOCK_CONTACTS) {
+    console.log('Contact sharing enforcement is disabled (BLOCK_CONTACTS=false).');
   }
 });
 
