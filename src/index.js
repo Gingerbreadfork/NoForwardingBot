@@ -842,6 +842,8 @@ const detectContactDetails = (message = {}) => {
 };
 
 const RECENT_MESSAGES_BY_CHAT = new Map();
+const BANS_IN_PROGRESS = new Set();
+const banKey = (chatId, userId) => `${chatId}:${userId}`;
 const REPEAT_MEDIA_FIELDS = ['photo', 'video', 'document', 'animation', 'audio', 'voice', 'video_note', 'sticker'];
 
 const normalizeRepeatText = (value = '') => value.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -922,7 +924,7 @@ const detectRepeatedMessageDetails = (chat = {}, message = {}) => {
   };
 };
 
-const detectViolation = async (ctx) => {
+const detectViolation = async (ctx, repeatedDetails = null) => {
   const { message, chat } = ctx;
   if (!message) {
     return null;
@@ -971,7 +973,6 @@ const detectViolation = async (ctx) => {
     };
   }
 
-  const repeatedDetails = detectRepeatedMessageDetails(chat, message);
   if (repeatedDetails) {
     return {
       ...VIOLATION_TYPES.repeatedMessage,
@@ -1135,8 +1136,10 @@ bot.on('message', async (ctx, next) => {
     return next();
   }
 
-  const violation = await detectViolation(ctx);
+  const repeatedDetails = detectRepeatedMessageDetails(chat, message);
   recordRecentMessage(chat, message);
+
+  const violation = await detectViolation(ctx, repeatedDetails);
 
   if (!violation) {
     return next();
@@ -1254,6 +1257,13 @@ const contextDetails = {
     return;
   }
 
+  const inProgressKey = banKey(chat.id, offender.id);
+  if (BANS_IN_PROGRESS.has(inProgressKey)) {
+    logConsole('info', 'Ban already in progress for offender, skipping duplicate', contextDetails);
+    return next();
+  }
+  BANS_IN_PROGRESS.add(inProgressKey);
+
   try {
     await ctx.banChatMember(offender.id, { revoke_messages: true });
 
@@ -1272,6 +1282,8 @@ const contextDetails = {
       ...contextDetails,
       error: err.message
     });
+  } finally {
+    BANS_IN_PROGRESS.delete(inProgressKey);
   }
 });
 
