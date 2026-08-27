@@ -890,6 +890,7 @@ const recordRecentMessage = (chat = {}, message = {}) => {
   }
   const entries = getRecentMessages(chat.id);
   entries.push({
+    messageId: message.message_id ?? null,
     senderId: message.from?.id ?? null,
     fingerprint: buildMessageFingerprint(message)
   });
@@ -913,15 +914,29 @@ const detectRepeatedMessageDetails = (chat = {}, message = {}) => {
   const entries = RECENT_MESSAGES_BY_CHAT.get(chat.id) ?? [];
   const priorMatches = entries.filter(
     (entry) => entry.senderId === senderId && entry.fingerprint === fingerprint
-  ).length;
-  if (priorMatches < REPEAT_MESSAGE_LIMIT) {
+  );
+  if (priorMatches.length < REPEAT_MESSAGE_LIMIT) {
     return null;
   }
   return {
     reason: 'repeated_message',
-    repeat_count: priorMatches + 1,
-    repeat_window: REPEAT_MESSAGE_WINDOW
+    repeat_count: priorMatches.length + 1,
+    repeat_window: REPEAT_MESSAGE_WINDOW,
+    prior_message_ids: priorMatches
+      .map((entry) => entry.messageId)
+      .filter((id) => Number.isInteger(id))
   };
+};
+
+const DELETE_BATCH_SIZE = 100;
+
+const deletePriorDuplicates = async (ctx, chatId, messageIds = []) => {
+  const uniqueIds = [...new Set(messageIds)];
+  for (let i = 0; i < uniqueIds.length; i += DELETE_BATCH_SIZE) {
+    const batch = uniqueIds.slice(i, i + DELETE_BATCH_SIZE);
+    await ctx.telegram.deleteMessages(chatId, batch);
+  }
+  return uniqueIds.length;
 };
 
 const detectViolation = async (ctx, repeatedDetails = null) => {
@@ -1240,6 +1255,30 @@ const contextDetails = {
         ...contextDetails,
         error: err.message
       });
+    }
+  }
+
+  const priorMessageIds = violation.details?.prior_message_ids ?? [];
+  if (priorMessageIds.length > 0) {
+    if (TEST_MODE) {
+      logConsole('info', 'TEST_MODE: would delete earlier duplicates', {
+        ...contextDetails,
+        prior_message_ids: priorMessageIds
+      });
+    } else {
+      try {
+        const deleted = await deletePriorDuplicates(ctx, chat.id, priorMessageIds);
+        logConsole('info', 'Earlier duplicates deleted', {
+          ...contextDetails,
+          deleted_count: deleted
+        });
+      } catch (err) {
+        logConsole('warn', 'Failed to delete earlier duplicates', {
+          ...contextDetails,
+          prior_message_ids: priorMessageIds,
+          error: err.message
+        });
+      }
     }
   }
 
