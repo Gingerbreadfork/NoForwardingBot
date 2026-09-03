@@ -155,6 +155,14 @@ const PUBLIC_CHAT_CACHE = new Map();
 const PUBLIC_CHAT_CACHE_TTL_MS = 5 * 60 * 1000;
 const CHAT_INFO_CACHE = new Map();
 const CHAT_INFO_TTL_MS = 3 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 2000;
+
+const setCacheEntry = (cache, key, value) => {
+  if (cache.size >= MAX_CACHE_ENTRIES && !cache.has(key)) {
+    cache.delete(cache.keys().next().value);
+  }
+  cache.set(key, value);
+};
 
 const sanitizeLinkCandidate = (value = '') =>
   value.replace(/^[<[(]+/, '').replace(/[>.)\]]+$/, '');
@@ -475,10 +483,10 @@ const fetchChatInfoWithCache = async (telegram, chatId) => {
 
   try {
     const chatInfo = await telegram.getChat(chatId);
-    CHAT_INFO_CACHE.set(chatId, { data: chatInfo, timestamp: now });
+    setCacheEntry(CHAT_INFO_CACHE, chatId, { data: chatInfo, timestamp: now });
     return chatInfo;
   } catch (err) {
-    CHAT_INFO_CACHE.set(chatId, { data: null, timestamp: now, error: err.message });
+    setCacheEntry(CHAT_INFO_CACHE, chatId, { data: null, timestamp: now, error: err.message });
     return null;
   }
 };
@@ -525,10 +533,10 @@ const resolvePublicChatType = async (telegram, username) => {
   try {
     const chatInfo = await telegram.getChat(`@${normalized}`);
     const type = chatInfo?.type || null;
-    PUBLIC_CHAT_CACHE.set(normalized, { type, timestamp: now });
+    setCacheEntry(PUBLIC_CHAT_CACHE, normalized, { type, timestamp: now });
     return type;
   } catch (err) {
-    PUBLIC_CHAT_CACHE.set(normalized, { type: null, timestamp: now, error: err.message });
+    setCacheEntry(PUBLIC_CHAT_CACHE, normalized, { type: null, timestamp: now, error: err.message });
     return null;
   }
 };
@@ -714,8 +722,8 @@ const classifyParsedLink = async (parsedLink, ctx, source = 'link') => {
   return null;
 };
 
-const findExternalGroupLink = async (ctx) => {
-  const candidates = collectTelegramLinksFromMessage(ctx.message);
+const findExternalGroupLink = async (ctx, message) => {
+  const candidates = collectTelegramLinksFromMessage(message);
   for (const candidate of candidates) {
     const parsed = parseTelegramLink(candidate.value);
     if (!parsed) {
@@ -815,7 +823,7 @@ const detectBotMessageDetails = (message = {}) => {
     };
   }
 
-  if (message.from?.is_bot) {
+  if (message.from?.is_bot && !message.sender_chat) {
     return {
       reason: 'bot_sender'
     };
@@ -841,12 +849,16 @@ const detectContactDetails = (message = {}) => {
   };
 };
 
-const RECENT_MESSAGES_BY_CHAT = new Map();
-const BANS_IN_PROGRESS = new Set();
-const banKey = (chatId, userId) => `${chatId}:${userId}`;
 const REPEAT_MEDIA_FIELDS = ['photo', 'video', 'document', 'animation', 'audio', 'voice', 'video_note', 'sticker'];
+const INVISIBLE_CHARS_REGEX = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFE00-\uFE0F\uFEFF]/g;
 
-const normalizeRepeatText = (value = '') => value.replace(/\s+/g, ' ').trim().toLowerCase();
+const normalizeRepeatText = (value = '') =>
+  value
+    .normalize('NFKC')
+    .replace(INVISIBLE_CHARS_REGEX, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 
 const extractMediaUniqueId = (message = {}) => {
   for (const field of REPEAT_MEDIA_FIELDS) {
@@ -875,72 +887,188 @@ const buildMessageFingerprint = (message = {}) => {
   return [text, mediaId ?? ''].join('\u0000');
 };
 
-const getRecentMessages = (chatId) => {
-  let entries = RECENT_MESSAGES_BY_CHAT.get(chatId);
-  if (!entries) {
-    entries = [];
-    RECENT_MESSAGES_BY_CHAT.set(chatId, entries);
+const SENDER_HISTORY_TTL_MS = 48 * 60 * 60 * 1000;
+const SENDER_HISTORY_MAX_ENTRIES = 200;
+const HISTORY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const RECENT_BAN_TTL_MS = 10 * 60 * 1000;
+const DELETE_BATCH_SIZE = 100;
+const MISSING_MESSAGE_ERROR_REGEX = /message to delete not found|message not found|MESSAGE_ID_INVALID/i;
+
+const CHAT_HISTORY = new Map();
+const BANS_IN_PROGRESS = new Set();
+const RECENT_BANS = new Map();
+const banKey = (chatId, senderId) => `${chatId}:${senderId}`;
+
+const resolveSender = (message = {}, chat = {}) => {
+  const senderChat = message.sender_chat;
+  if (senderChat?.id !== undefined && !message.is_automatic_forward) {
+    return { kind: 'chat', id: senderChat.id, entity: senderChat };
   }
-  return entries;
+  if (message.from?.id !== undefined) {
+    return { kind: 'user', id: message.from.id, entity: message.from };
+  }
+  return null;
 };
 
-const recordRecentMessage = (chat = {}, message = {}) => {
-  if (!BLOCK_REPEATED_MESSAGES || chat.id === undefined) {
+const getChatHistory = (chatId) => {
+  let history = CHAT_HISTORY.get(chatId);
+  if (!history) {
+    history = { window: [], bySender: new Map() };
+    CHAT_HISTORY.set(chatId, history);
+  }
+  return history;
+};
+
+const recordMessageHistory = (chat = {}, message = {}, sender = null) => {
+  if (chat.id === undefined || !Number.isInteger(message.message_id)) {
     return;
   }
-  const entries = getRecentMessages(chat.id);
-  entries.push({
-    messageId: message.message_id ?? null,
-    senderId: message.from?.id ?? null,
-    fingerprint: buildMessageFingerprint(message)
-  });
-  if (entries.length > REPEAT_MESSAGE_WINDOW) {
-    entries.splice(0, entries.length - REPEAT_MESSAGE_WINDOW);
+  const history = getChatHistory(chat.id);
+  const senderId = sender?.id ?? null;
+  const fingerprint = buildMessageFingerprint(message);
+
+  history.window.push({ messageId: message.message_id, senderId, fingerprint });
+  if (history.window.length > REPEAT_MESSAGE_WINDOW) {
+    history.window.splice(0, history.window.length - REPEAT_MESSAGE_WINDOW);
+  }
+
+  if (senderId === null) {
+    return;
+  }
+  let entries = history.bySender.get(senderId);
+  if (!entries) {
+    entries = [];
+    history.bySender.set(senderId, entries);
+  }
+  entries.push({ messageId: message.message_id, fingerprint, at: Date.now() });
+  if (entries.length > SENDER_HISTORY_MAX_ENTRIES) {
+    entries.splice(0, entries.length - SENDER_HISTORY_MAX_ENTRIES);
   }
 };
 
-const detectRepeatedMessageDetails = (chat = {}, message = {}) => {
-  if (!BLOCK_REPEATED_MESSAGES || message.is_automatic_forward || chat.id === undefined) {
-    return null;
+const getSenderHistory = (chatId, senderId) => {
+  const entries = CHAT_HISTORY.get(chatId)?.bySender.get(senderId);
+  if (!entries) {
+    return [];
   }
-  const senderId = message.from?.id;
-  if (senderId === undefined) {
+  const cutoff = Date.now() - SENDER_HISTORY_TTL_MS;
+  return entries.filter((entry) => entry.at >= cutoff);
+};
+
+const forgetSenderMessages = (chatId, senderId, messageIds = []) => {
+  const history = CHAT_HISTORY.get(chatId);
+  const entries = history?.bySender.get(senderId);
+  if (!entries) {
+    return;
+  }
+  const ids = new Set(messageIds);
+  const remaining = entries.filter((entry) => !ids.has(entry.messageId));
+  if (remaining.length) {
+    history.bySender.set(senderId, remaining);
+  } else {
+    history.bySender.delete(senderId);
+  }
+};
+
+const sweepHistory = () => {
+  const cutoff = Date.now() - SENDER_HISTORY_TTL_MS;
+  for (const history of CHAT_HISTORY.values()) {
+    for (const [senderId, entries] of history.bySender) {
+      const remaining = entries.filter((entry) => entry.at >= cutoff);
+      if (remaining.length) {
+        history.bySender.set(senderId, remaining);
+      } else {
+        history.bySender.delete(senderId);
+      }
+    }
+  }
+  const banCutoff = Date.now() - RECENT_BAN_TTL_MS;
+  for (const [key, bannedAt] of RECENT_BANS) {
+    if (bannedAt < banCutoff) {
+      RECENT_BANS.delete(key);
+    }
+  }
+};
+
+setInterval(sweepHistory, HISTORY_SWEEP_INTERVAL_MS).unref();
+
+const markRecentBan = (chatId, senderId) => {
+  RECENT_BANS.set(banKey(chatId, senderId), Date.now());
+};
+
+const wasRecentlyBanned = (chatId, senderId) => {
+  const bannedAt = RECENT_BANS.get(banKey(chatId, senderId));
+  return bannedAt !== undefined && Date.now() - bannedAt < RECENT_BAN_TTL_MS;
+};
+
+const detectRepeatedMessageDetails = (chat = {}, message = {}, sender = null) => {
+  if (!BLOCK_REPEATED_MESSAGES || message.is_automatic_forward || chat.id === undefined || !sender) {
     return null;
   }
   const fingerprint = buildMessageFingerprint(message);
   if (!fingerprint) {
     return null;
   }
-  const entries = RECENT_MESSAGES_BY_CHAT.get(chat.id) ?? [];
-  const priorMatches = entries.filter(
-    (entry) => entry.senderId === senderId && entry.fingerprint === fingerprint
+  const window = CHAT_HISTORY.get(chat.id)?.window ?? [];
+  const windowMatches = window.filter(
+    (entry) => entry.senderId === sender.id && entry.fingerprint === fingerprint
   );
-  if (priorMatches.length < REPEAT_MESSAGE_LIMIT) {
+  if (windowMatches.length < REPEAT_MESSAGE_LIMIT) {
     return null;
+  }
+  const priorMessageIds = new Set(windowMatches.map((entry) => entry.messageId));
+  for (const entry of getSenderHistory(chat.id, sender.id)) {
+    if (entry.fingerprint === fingerprint) {
+      priorMessageIds.add(entry.messageId);
+    }
   }
   return {
     reason: 'repeated_message',
-    repeat_count: priorMatches.length + 1,
+    repeat_count: windowMatches.length + 1,
     repeat_window: REPEAT_MESSAGE_WINDOW,
-    prior_message_ids: priorMatches
-      .map((entry) => entry.messageId)
-      .filter((id) => Number.isInteger(id))
+    prior_message_ids: [...priorMessageIds]
   };
 };
 
-const DELETE_BATCH_SIZE = 100;
+const isMissingMessageError = (err) =>
+  MISSING_MESSAGE_ERROR_REGEX.test(err?.description ?? err?.message ?? '');
 
-const deletePriorDuplicates = async (ctx, chatId, messageIds = []) => {
-  const uniqueIds = [...new Set(messageIds)];
-  for (let i = 0; i < uniqueIds.length; i += DELETE_BATCH_SIZE) {
-    const batch = uniqueIds.slice(i, i + DELETE_BATCH_SIZE);
-    await ctx.telegram.deleteMessages(chatId, batch);
+const deleteMessagesBestEffort = async (telegram, chatId, messageIds = []) => {
+  const ids = [...new Set(messageIds.filter((id) => Number.isInteger(id)))];
+  const failures = [];
+  let deleted = 0;
+
+  for (let i = 0; i < ids.length; i += DELETE_BATCH_SIZE) {
+    const batch = ids.slice(i, i + DELETE_BATCH_SIZE);
+    const batchDeleted = await telegram.deleteMessages(chatId, batch).then(() => true, () => false);
+    if (batchDeleted) {
+      deleted += batch.length;
+      continue;
+    }
+    for (const id of batch) {
+      try {
+        await telegram.deleteMessage(chatId, id);
+        deleted += 1;
+      } catch (err) {
+        if (isMissingMessageError(err)) {
+          deleted += 1;
+        } else {
+          failures.push({ message_id: id, error: err.message });
+        }
+      }
+    }
   }
-  return uniqueIds.length;
+
+  return { deleted, failures };
 };
 
-const detectViolation = async (ctx, repeatedDetails = null) => {
-  const { message, chat } = ctx;
+const banSender = (telegram, chatId, sender) =>
+  sender.kind === 'chat'
+    ? telegram.banChatSenderChat(chatId, sender.id)
+    : telegram.banChatMember(chatId, sender.id, undefined, { revoke_messages: true });
+
+const detectViolation = async (ctx, message, repeatedDetails = null) => {
+  const { chat } = ctx;
   if (!message) {
     return null;
   }
@@ -960,7 +1088,7 @@ const detectViolation = async (ctx, repeatedDetails = null) => {
     };
   }
 
-  const linkDetails = await findExternalGroupLink(ctx);
+  const linkDetails = await findExternalGroupLink(ctx, message);
   if (linkDetails) {
     return {
       ...VIOLATION_TYPES.groupLink,
@@ -1031,13 +1159,17 @@ const formatTimestamp = () => new Date().toISOString();
 
 const buildUserLabel = (user) => {
   if (!user) return 'Unknown user';
-  const name = [user.first_name, user.last_name].filter(Boolean).join(' ').trim() || user.username;
+  const name = [user.first_name, user.last_name].filter(Boolean).join(' ').trim() || user.title;
   if (name && user.username) {
     return `${name} (@${user.username})`;
   }
 
   if (name) {
     return name;
+  }
+
+  if (user.username) {
+    return `@${user.username}`;
   }
 
   return `user ${user.id}`;
@@ -1048,13 +1180,54 @@ const normalizeForLog = (value) => {
   return String(value).replace(/\s+/g, ' ').trim();
 };
 
-const describeContext = (chat, offender, message) => ({
+const describeContext = (chat, sender, message) => ({
   chat_id: chat?.id ?? 'unknown',
   chat_title: normalizeForLog(chat?.title || chat?.username || ''),
-  user_id: offender?.id ?? 'unknown',
-  user: normalizeForLog(buildUserLabel(offender)),
+  user_id: sender?.id ?? 'unknown',
+  user: normalizeForLog(buildUserLabel(sender?.entity)),
+  ...(sender?.kind === 'chat' ? { sender_type: 'chat' } : {}),
   message_id: message?.message_id ?? 'unknown'
 });
+
+const VIOLATION_CONTEXT_FIELDS = [
+  ['kind', 'link_kind'],
+  ['link', 'link'],
+  ['reason', 'reason'],
+  ['origin', 'link_origin'],
+  ['unconfirmed', 'link_unconfirmed'],
+  ['target.username', 'target_username'],
+  ['target.invite_code', 'invite_code'],
+  ['target.internal_id', 'target_internal_id'],
+  ['via_bot_username'],
+  ['via_bot_id'],
+  ['quoted_via_bot_username'],
+  ['quoted_via_bot_id'],
+  ['quoted_message_id'],
+  ['quoted_chat_id'],
+  ['quoted_chat_title'],
+  ['contact_user_id'],
+  ['repeat_count'],
+  ['repeat_window'],
+  ['prior_message_ids']
+];
+
+const readPath = (source, path) =>
+  path.split('.').reduce((value, key) => (value == null ? undefined : value[key]), source);
+
+const describeViolation = (violation) => {
+  const context = { violation: violation.type };
+  for (const [path, key = path] of VIOLATION_CONTEXT_FIELDS) {
+    const value = readPath(violation.details, path);
+    if (value === undefined || value === null || value === '' || value === false) {
+      continue;
+    }
+    if (Array.isArray(value) && !value.length) {
+      continue;
+    }
+    context[key] = value;
+  }
+  return context;
+};
 
 const LOG_METHODS = {
   info: console.info.bind(console),
@@ -1086,28 +1259,13 @@ const noteMissingInvitePermissions = (ctx, chat = {}) => {
   });
 };
 
-const getBanSkipReason = (message) => {
-  if (!message) {
-    return 'missing_message';
-  }
-
-  if (message.is_automatic_forward) {
-    return 'automatic_forward';
-  }
-
-  if (!message.from) {
-    return 'missing_sender';
-  }
-
-  return null;
-};
-
 const logAction = async (ctx, text, options = {}) => {
   if (!CHAT_NOTIFICATIONS_ENABLED) {
     return;
   }
-  const threadId = ctx.message?.message_thread_id;
-  const chatId = ctx.chat?.id ?? ctx.message?.chat?.id;
+  const source = ctx.message ?? ctx.editedMessage;
+  const threadId = source?.is_topic_message ? source.message_thread_id : undefined;
+  const chatId = ctx.chat?.id ?? source?.chat?.id;
   if (!chatId) {
     return;
   }
@@ -1123,14 +1281,15 @@ const logAction = async (ctx, text, options = {}) => {
   }
 };
 
-const recordBan = async ({ chat, offender, message }) => {
+const recordBan = async ({ chat, offender, message, violation }) => {
   const logLine = [
     formatTimestamp(),
     `chat_id=${chat?.id ?? 'unknown'}`,
     `chat_title="${normalizeForLog(chat?.title || chat?.username || '')}"`,
     `user_id=${offender?.id ?? 'unknown'}`,
     `user="${normalizeForLog(buildUserLabel(offender))}"`,
-    `message_id=${message?.message_id ?? 'unknown'}`
+    `message_id=${message?.message_id ?? 'unknown'}`,
+    `violation=${violation?.type ?? 'unknown'}`
   ].join('\t');
 
   try {
@@ -1144,99 +1303,105 @@ const recordBan = async ({ chat, offender, message }) => {
   }
 };
 
-bot.on('message', async (ctx, next) => {
-  const { chat, message } = ctx;
-
-  if (!isGroupChat(chat) || !message) {
-    return next();
+const getProtectedSenderReason = async (ctx, chat, sender, contextDetails) => {
+  if (sender.kind === 'chat') {
+    if (sender.id === chat.id) {
+      return 'anonymous_admin';
+    }
+    const metadata = await ensureChatMetadata(ctx);
+    return metadata.chat?.linked_chat_id === sender.id ? 'linked_channel' : null;
   }
-
-  const repeatedDetails = detectRepeatedMessageDetails(chat, message);
-  recordRecentMessage(chat, message);
-
-  const violation = await detectViolation(ctx, repeatedDetails);
-
-  if (!violation) {
-    return next();
-  }
-
-  const offender = message.from;
-const contextDetails = {
-  ...describeContext(chat, offender, message),
-  violation: violation.type,
-  ...(violation.details?.kind ? { link_kind: violation.details.kind } : {}),
-  ...(violation.details?.link ? { link: violation.details.link } : {}),
-  ...(violation.details?.reason ? { reason: violation.details.reason } : {}),
-  ...(violation.details?.origin ? { link_origin: violation.details.origin } : {}),
-  ...(violation.details?.unconfirmed ? { link_unconfirmed: true } : {}),
-  ...(violation.details?.target?.username
-    ? { target_username: violation.details.target.username }
-      : {}),
-    ...(violation.details?.target?.invite_code
-      ? { invite_code: violation.details.target.invite_code }
-      : {}),
-    ...(violation.details?.target?.internal_id
-      ? { target_internal_id: violation.details.target.internal_id }
-      : {}),
-    ...(violation.details?.via_bot_username ? { via_bot_username: violation.details.via_bot_username } : {}),
-    ...(violation.details && Object.hasOwn(violation.details, 'via_bot_id')
-      ? { via_bot_id: violation.details.via_bot_id }
-      : {}),
-    ...(violation.details?.quoted_via_bot_username
-      ? { quoted_via_bot_username: violation.details.quoted_via_bot_username }
-      : {}),
-    ...(violation.details && Object.hasOwn(violation.details, 'quoted_via_bot_id')
-      ? { quoted_via_bot_id: violation.details.quoted_via_bot_id }
-      : {}),
-    ...(violation.details && Object.hasOwn(violation.details, 'quoted_message_id')
-      ? { quoted_message_id: violation.details.quoted_message_id }
-      : {}),
-    ...(violation.details?.quoted_chat_id ? { quoted_chat_id: violation.details.quoted_chat_id } : {}),
-    ...(violation.details?.quoted_chat_title
-      ? { quoted_chat_title: violation.details.quoted_chat_title }
-      : {}),
-    ...(violation.details && Object.hasOwn(violation.details, 'contact_user_id')
-      ? { contact_user_id: violation.details.contact_user_id }
-      : {}),
-    ...(violation.details?.repeat_count ? { repeat_count: violation.details.repeat_count } : {}),
-    ...(violation.details?.repeat_window ? { repeat_window: violation.details.repeat_window } : {})
-};
-
-  if (violation.type === 'forward' && message.is_automatic_forward) {
-    logConsole('info', 'Ignored automatic forward from linked chat', contextDetails);
-    return next();
-  }
-
-  if (!offender) {
-    logConsole('warn', 'Detected violation missing sender metadata', contextDetails);
-    return next();
-  }
-
-  let memberInfo;
 
   try {
-    memberInfo = await ctx.telegram.getChatMember(chat.id, offender.id);
+    const memberInfo = await ctx.telegram.getChatMember(chat.id, sender.id);
+    return PROTECTED_STATUSES.has(memberInfo.status) ? memberInfo.status : null;
   } catch (err) {
     await logAction(
       ctx,
-      `Failed to inspect ${buildUserLabel(offender)} before acting on a violation. Error: ${err.message}`
+      `Failed to inspect ${buildUserLabel(sender.entity)} before acting on a violation. Error: ${err.message}`
     );
     logConsole('warn', 'Failed to inspect offender before enforcement', {
       ...contextDetails,
       error: err.message
     });
+    return null;
   }
+};
 
-  if (memberInfo && PROTECTED_STATUSES.has(memberInfo.status)) {
-    const adminContext = {
-      ...contextDetails,
-      status: memberInfo.status
-    };
-    logConsole('info', 'Ignoring violation from protected member', adminContext);
+const removeMessageFromBannedSender = async (ctx, chat, message, sender) => {
+  const context = { ...describeContext(chat, sender, message), reason: 'recently_banned' };
+  if (TEST_MODE) {
+    logConsole('info', 'TEST_MODE: would delete message from recently banned sender', context);
+    return;
+  }
+  const { deleted, failures } = await deleteMessagesBestEffort(ctx.telegram, chat.id, [message.message_id]);
+  logConsole(failures.length ? 'warn' : 'info', 'Removed message from recently banned sender', {
+    ...context,
+    deleted_count: deleted,
+    ...(failures.length ? { failures } : {})
+  });
+};
+
+const handleGroupMessage = async (ctx, next) => {
+  const { chat } = ctx;
+  const message = ctx.message ?? ctx.editedMessage;
+  const isEdit = Boolean(ctx.editedMessage);
+
+  if (!isGroupChat(chat) || !message) {
     return next();
   }
 
+  const sender = resolveSender(message, chat);
+
+  if (sender && wasRecentlyBanned(chat.id, sender.id)) {
+    await removeMessageFromBannedSender(ctx, chat, message, sender);
+    return;
+  }
+
+  let repeatedDetails = null;
+  if (!isEdit) {
+    repeatedDetails = detectRepeatedMessageDetails(chat, message, sender);
+    recordMessageHistory(chat, message, sender);
+  }
+
+  const violation = await detectViolation(ctx, message, repeatedDetails);
+
+  if (!violation) {
+    return next();
+  }
+
+  const contextDetails = {
+    ...describeContext(chat, sender, message),
+    ...(isEdit ? { edited: true } : {}),
+    ...describeViolation(violation)
+  };
+
+  const isAutomaticForward = Boolean(message.is_automatic_forward);
+
+  if (violation.type === 'forward' && isAutomaticForward) {
+    logConsole('info', 'Ignored automatic forward from linked chat', contextDetails);
+    return next();
+  }
+
+  if (!sender) {
+    logConsole('warn', 'Detected violation missing sender metadata', contextDetails);
+    return next();
+  }
+
+  if (!isAutomaticForward) {
+    const protectedStatus = await getProtectedSenderReason(ctx, chat, sender, contextDetails);
+    if (protectedStatus) {
+      logConsole('info', 'Ignoring violation from protected member', {
+        ...contextDetails,
+        status: protectedStatus
+      });
+      return next();
+    }
+  }
+
   const violationLabelLower = violation.logLabel.toLowerCase();
+  const offenderLabel = buildUserLabel(sender.entity);
+  const offenderNoun = sender.kind === 'chat' ? 'channel' : 'user';
 
   logConsole('info', `${violation.logLabel} detected`, contextDetails);
 
@@ -1247,90 +1412,116 @@ const contextDetails = {
       await ctx.deleteMessage(message.message_id);
       logConsole('info', `${violation.logLabel} deleted`, contextDetails);
     } catch (err) {
-      await logAction(
-        ctx,
-        `${violation.logLabel} detected but could not delete it. Error: ${err.message}`
-      );
-      logConsole('warn', `Failed to delete ${violationLabelLower}`, {
-        ...contextDetails,
-        error: err.message
-      });
-    }
-  }
-
-  const priorMessageIds = violation.details?.prior_message_ids ?? [];
-  if (priorMessageIds.length > 0) {
-    if (TEST_MODE) {
-      logConsole('info', 'TEST_MODE: would delete earlier duplicates', {
-        ...contextDetails,
-        prior_message_ids: priorMessageIds
-      });
-    } else {
-      try {
-        const deleted = await deletePriorDuplicates(ctx, chat.id, priorMessageIds);
-        logConsole('info', 'Earlier duplicates deleted', {
+      if (isMissingMessageError(err)) {
+        logConsole('info', `${violation.logLabel} was already deleted`, contextDetails);
+      } else {
+        await logAction(
+          ctx,
+          `${violation.logLabel} detected but could not delete it. Error: ${err.message}`
+        );
+        logConsole('warn', `Failed to delete ${violationLabelLower}`, {
           ...contextDetails,
-          deleted_count: deleted
-        });
-      } catch (err) {
-        logConsole('warn', 'Failed to delete earlier duplicates', {
-          ...contextDetails,
-          prior_message_ids: priorMessageIds,
           error: err.message
         });
       }
     }
   }
 
-  const skipReason = getBanSkipReason(message);
-  if (skipReason) {
+  if (isAutomaticForward) {
     logConsole('info', `Skipping ban for ${violationLabelLower}`, {
       ...contextDetails,
-      reason: skipReason
+      reason: 'automatic_forward'
     });
     return next();
   }
 
+  const priorDuplicateIds = violation.details?.prior_message_ids ?? [];
+  const trackedIds = () =>
+    getSenderHistory(chat.id, sender.id)
+      .map((entry) => entry.messageId)
+      .filter((id) => id !== message.message_id);
+
   if (TEST_MODE) {
-    logConsole('info', `TEST_MODE: would ban user for ${violation.actionDescription}`, contextDetails);
+    logConsole('info', `TEST_MODE: would ban ${offenderNoun} for ${violation.actionDescription}`, contextDetails);
+    logConsole('info', 'TEST_MODE: would delete earlier messages from offender', {
+      ...contextDetails,
+      message_ids: trackedIds()
+    });
     return;
   }
 
-  const inProgressKey = banKey(chat.id, offender.id);
+  const inProgressKey = banKey(chat.id, sender.id);
   if (BANS_IN_PROGRESS.has(inProgressKey)) {
     logConsole('info', 'Ban already in progress for offender, skipping duplicate', contextDetails);
+    return next();
+  }
+  if (wasRecentlyBanned(chat.id, sender.id)) {
+    logConsole('info', 'Offender was already banned, skipping duplicate', contextDetails);
     return next();
   }
   BANS_IN_PROGRESS.add(inProgressKey);
 
   try {
-    await ctx.banChatMember(offender.id, { revoke_messages: true });
+    let banned = false;
+    try {
+      await banSender(ctx.telegram, chat.id, sender);
+      banned = true;
+      markRecentBan(chat.id, sender.id);
+    } catch (err) {
+      await logAction(
+        ctx,
+        `Tried to ban ${offenderLabel} for ${violation.actionDescription} but failed. Error: ${err.message}`
+      );
+      logConsole('error', `Failed to ban ${offenderNoun} for ${violation.actionDescription}`, {
+        ...contextDetails,
+        error: err.message
+      });
+    }
 
-    await logAction(
-      ctx,
-      `🚫 ${buildUserLabel(offender)} was banned for ${violation.actionDescription}.`
-    );
-    logConsole('info', `User banned for ${violation.actionDescription}`, contextDetails);
-    await recordBan({ chat, offender, message });
-  } catch (err) {
-    await logAction(
-      ctx,
-      `Tried to ban ${buildUserLabel(offender)} for ${violation.actionDescription} but failed. Error: ${err.message}`
-    );
-    logConsole('error', `Failed to ban user for ${violation.actionDescription}`, {
-      ...contextDetails,
-      error: err.message
-    });
+    const purgeTargets = banned
+      ? trackedIds()
+      : priorDuplicateIds.filter((id) => id !== message.message_id);
+    let purgedCount = 0;
+
+    if (purgeTargets.length) {
+      const { deleted, failures } = await deleteMessagesBestEffort(ctx.telegram, chat.id, purgeTargets);
+      purgedCount = deleted;
+      logConsole(failures.length ? 'warn' : 'info', 'Earlier messages from offender deleted', {
+        ...contextDetails,
+        purge_scope: banned ? 'all_tracked' : 'duplicates',
+        requested_count: purgeTargets.length,
+        deleted_count: deleted,
+        ...(failures.length ? { failures } : {})
+      });
+    }
+    forgetSenderMessages(chat.id, sender.id, banned ? [...purgeTargets, message.message_id] : purgeTargets);
+
+    if (banned) {
+      const purgeNote = purgedCount > 0
+        ? ` ${purgedCount} earlier message${purgedCount === 1 ? '' : 's'} removed.`
+        : '';
+      await logAction(
+        ctx,
+        `🚫 ${offenderLabel} was banned for ${violation.actionDescription}.${purgeNote}`
+      );
+      logConsole('info', `${offenderNoun === 'chat' ? 'Channel' : 'User'} banned for ${violation.actionDescription}`, {
+        ...contextDetails,
+        purged_count: purgedCount
+      });
+      await recordBan({ chat, offender: sender.entity, message, violation });
+    }
   } finally {
     BANS_IN_PROGRESS.delete(inProgressKey);
   }
-});
+};
+
+bot.on(['message', 'edited_message'], handleGroupMessage);
 
 bot.catch((err) => {
   console.error('Bot error:', err);
 });
 
-bot.launch({ dropPendingUpdates: true }).then(() => {
+const announceStartup = () => {
   console.log('NoForwardingBot is now watching for forwarded spam...');
   if (TEST_MODE) {
     console.warn('NoForwardingBot is running in TEST_MODE. No bans or deletions will be performed.');
@@ -1345,6 +1536,11 @@ bot.launch({ dropPendingUpdates: true }).then(() => {
   } else {
     console.log('Repeated message enforcement is disabled (BLOCK_REPEATED_MESSAGES=false).');
   }
+};
+
+bot.launch({ dropPendingUpdates: true }, announceStartup).catch((err) => {
+  console.error('NoForwardingBot stopped due to an error:', err?.message ?? err);
+  process.exit(1);
 });
 
 const gracefulShutdown = (signal) => {

@@ -10,6 +10,9 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
 - Removes quotes of users from other chats to stop cross-posting spam
 - Bans anyone who shares a contact card (toggle with `BLOCK_CONTACTS`)
 - Bans anyone who sends the same message more than twice within the last 25 messages (limit, window, and toggle are configurable)
+- Cleans up after a ban by deleting every message the bot has seen from the offender in the last 48 hours
+- Re-checks edited messages so spam cannot be edited into an existing post
+- Handles posts made "as a channel" by banning the channel, while leaving anonymous admins and the linked channel alone
 - Deletes the forwarded message before anyone sees it
 - Bans the sender, while skipping administrators and automatic forwards from linked channels
 - Writes every ban to `banned.log` (or a custom file) for effortless auditing
@@ -45,6 +48,10 @@ NoForwardingBot is an aggressive Telegram moderator that eliminates forwarded sp
    # or
    pnpm dev
    ```
+6. Optional: run the offline smoke test (no token or network needed):
+   ```bash
+   pnpm test
+   ```
 
 ## How it Works
 
@@ -58,6 +65,8 @@ Want to keep moderation noise out of the chat entirely? Set `CHAT_NOTIFICATIONS_
 
 Shared contact cards are treated as spam by default: the message is deleted and the sender is banned (admins are exempt, as with every other rule). Set `BLOCK_CONTACTS=false` to allow members to share contacts.
 
-Repeated messages are also treated as spam. The bot keeps the last `REPEAT_MESSAGE_WINDOW` messages (default 25) per chat in memory; if a member sends the same message more than `REPEAT_MESSAGE_LIMIT` times (default 2) within that window, the message and the earlier copies are deleted and the member is banned. Text is compared case-insensitively with whitespace collapsed, and media (photos, videos, documents, stickers, etc.) is compared by Telegram file ID. Set `REPEAT_MESSAGE_MIN_LENGTH` to ignore short text such as "ok" or "lol", or set `BLOCK_REPEATED_MESSAGES=false` to turn the rule off. The window is in-memory only and resets when the bot restarts.
+Repeated messages are also treated as spam. The bot keeps the last `REPEAT_MESSAGE_WINDOW` messages (default 25) per chat in memory; if a member sends the same message more than `REPEAT_MESSAGE_LIMIT` times (default 2) within that window, the message is deleted and the member is banned. Text is compared case-insensitively with whitespace collapsed, Unicode look-alikes folded (NFKC), and invisible characters stripped; media (photos, videos, documents, stickers, etc.) is compared by Telegram file ID. Set `REPEAT_MESSAGE_MIN_LENGTH` to ignore short text such as "ok" or "lol", or set `BLOCK_REPEATED_MESSAGES=false` to turn the rule off. The window is in-memory only and resets when the bot restarts.
+
+Whenever a ban succeeds, for any rule, the bot also deletes every message it has seen from that sender in the chat during the last 48 hours (up to 200 per sender), so earlier copies of the spam are removed even if they have already scrolled out of the repeat window. If the ban fails (for example, the bot lacks the ban permission) only the earlier identical copies are removed. Messages that arrive from a sender in the few minutes after their ban are deleted on sight. This history is in-memory as well, so messages posted before the bot started cannot be cleaned up.
 
 For best results, give the bot the administrator permissions to delete messages, ban members, and manage invites. Without the invite permission the bot cannot confirm whether a `t.me/+HASH` link belongs to your chat, so private invites might slip through moderation. The bot refuses to start if it does not have a valid token.

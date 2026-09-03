@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node src/index.js"
+    "dev": "node src/index.js",
+    "test": "node test/smoke.test.mjs && TEST_MODE=true node test/smoke.test.mjs"
   },
   "engines": {
     "node": ">=18.0.0"
